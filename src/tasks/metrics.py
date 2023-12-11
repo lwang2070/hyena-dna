@@ -7,6 +7,7 @@ import torchmetrics.functional as tm_f
 import torch.distributions as dist
 from sklearn.metrics import f1_score, roc_auc_score, matthews_corrcoef
 from torchmetrics import Metric
+from einops import rearrange
 from torchmetrics.classification import MulticlassRecall, MulticlassPrecision
 
 class CorrectAggregatedMetric(Metric):
@@ -295,6 +296,21 @@ def mae(outs, y, len_batch=None):
         y_masked = torch.masked_select(y, mask)
         return F.l1_loss(outs_masked, y_masked)
 
+def kl_div_plus(x, y, chunk_size=128, ignore_index=-100):
+    ### kl loss
+    scores = F.softmax(x, dim=-1).log()
+    x_chunk = rearrange(scores, 'b (k c) d -> b k c d', c=chunk_size)
+    y_chunk = rearrange(F.one_hot(y, num_classes=x.size(-1)), 'b (k c) d -> b k c d', c=chunk_size)
+    x_chunk_dist = x_chunk.mean(2)[:, :-1] # B, chunk_size - 1, vocab_dim
+    y_chunk_dist = y_chunk.mean(2, dtype=x.dtype)[:, 1:] # B, chunk_size - 1, vocab_dim
+    
+    # ce loss
+    logits = rearrange(x, '... C -> (...) C')
+    y = rearrange(y, '... -> (...)')
+    logits = logits.view(-1, logits.shape[-1])
+    y = y.view(-1)
+    return F.cross_entropy(logits, y, ignore_index=ignore_index) + F.kl_div(x_chunk_dist, y_chunk_dist)
+
 
 # Metrics that can depend on the loss
 def loss(x, y, loss_fn):
@@ -331,6 +347,7 @@ output_metric_fns = {
     "mcc": mcc,
     "mse": mse,
     "mae": mae,
+    'kl_plus': kl_div_plus,
     "forecast_rmse": forecast_rmse,
     "f1_binary": f1_binary,
     "f1_macro": f1_macro,

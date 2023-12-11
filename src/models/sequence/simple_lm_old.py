@@ -33,10 +33,9 @@ class SelfAttention(nn.Module):
         attention_dropout: The dropout rate to apply to the attention
                            (default: 0.0)
     """
-    def __init__(self, causal=False, chunk_size=-1, softmax_scale=None, attention_dropout=0.0):
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
         super().__init__()
         self.causal = causal
-        self.chunk_size = chunk_size
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
 
@@ -53,19 +52,9 @@ class SelfAttention(nn.Module):
         causal = self.causal if causal is None else causal
         q, k, v = qkv.unbind(dim=2)
         softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
-
-        q = q.unsqueeze(1)
-        k = k.unsqueeze(1)
-        v = v.unsqueeze(1)
-
-        if self.chunk_size > 0:
-            q = rearrange(q, 'b 1 (k c) h d -> b k c h d', c=self.chunk_size)
-            k = rearrange(k, 'b 1 (k c) h d -> b k c h d', c=self.chunk_size)
-            v = rearrange(v, 'b 1 (k c) h d -> b k c h d', c=self.chunk_size)
-        
-        scores = torch.einsum('bkthd,bkshd->bkhts', q, k * softmax_scale)
+        scores = torch.einsum('bthd,bshd->bhts', q, k * softmax_scale)
         if key_padding_mask is not None:
-            padding_mask = torch.full((batch_size, self.chunk_size), -10000.0, dtype=scores.dtype,
+            padding_mask = torch.full((batch_size, seqlen), -10000.0, dtype=scores.dtype,
                                       device=scores.device)
             padding_mask.masked_fill_(key_padding_mask, 0.0)
             # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
@@ -73,19 +62,19 @@ class SelfAttention(nn.Module):
         if causal:
             # "triu_tril_cuda_template" not implemented for 'BFloat16'
             # So we have to construct the mask in float
-            causal_mask = torch.triu(torch.full((self.chunk_size, self.chunk_size), -10000.0, device=scores.device), 1)
+            causal_mask = torch.triu(torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1)
             # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
             scores = scores + causal_mask.to(dtype=scores.dtype)
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
         attention_drop = F.dropout(attention, self.dropout_p if self.training else 0.0)
-        output = rearrange(torch.einsum('bkhts,bkshd->bkthd', attention_drop, v), 'b k c h d -> b (k c) h d')
+        output = torch.einsum('bhts,bshd->bthd', attention_drop, v)
         return output
 
 class MHA(nn.Module):
     """Multi-head self-attention and cross-attention
     """
 
-    def __init__(self, embed_dim, num_heads, chunk_size=-1, bias=True, dropout=0.0,
+    def __init__(self, embed_dim, num_heads, bias=True, dropout=0.0,
                  softmax_scale=None, causal=False, layer_idx=None, dwconv=False,return_residual=False,device=None, dtype=None) -> None:
         """
             return_residual: whether to return the input x along with the output. This is for
@@ -116,7 +105,7 @@ class MHA(nn.Module):
             self.dwconv_qkv = nn.Conv1d(3 * embed_dim, 3 * embed_dim, kernel_size=3, padding=2,
                                         groups=3 * embed_dim)
 
-        self.inner_attn = inner_attn_cls(causal=causal, chunk_size=chunk_size, softmax_scale=softmax_scale,
+        self.inner_attn = inner_attn_cls(causal=causal, softmax_scale=softmax_scale,
                                          attention_dropout=dropout)
 
         # output projection always have the bias (for now)
@@ -317,7 +306,7 @@ class Block(nn.Module):
 
             return hidden_states
 
-def create_mixer_cls(layer=None, chunk_size=-1,
+def create_mixer_cls(layer=None,
                      attn_layer_idx=None, attn_cfg=None, layer_idx=None,
                      device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
@@ -326,7 +315,7 @@ def create_mixer_cls(layer=None, chunk_size=-1,
 
         mha_cls = MHA
 
-        mixer_cls = partial(mha_cls, causal=causal, layer_idx=layer_idx, chunk_size=chunk_size,
+        mixer_cls = partial(mha_cls, causal=causal, layer_idx=layer_idx,
                             **(attn_cfg if attn_cfg is not None else {}),**factory_kwargs)
     else:
         mixer_cls = instantiate(registry.layer, layer, partial=True, layer_idx=layer_idx, **factory_kwargs)
@@ -343,14 +332,14 @@ def create_mlp_cls(d_model, d_inner=None, device=None, dtype=None):
     return mlp_cls
 
 
-def create_block(d_model, d_inner=None, chunk_size=-1,
+def create_block(d_model, d_inner=None,
                  layer=None, attn_layer_idx=None,
                  attn_cfg=None, layer_norm_epsilon=1e-5,
                  resid_dropout1=0.0, resid_dropout2=0.0, residual_in_fp32=False,
                  layer_idx=None,
                  device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
-    mixer_cls = create_mixer_cls(layer=layer, chunk_size=chunk_size,
+    mixer_cls = create_mixer_cls(layer=layer,
                                  attn_layer_idx=attn_layer_idx,
                                  attn_cfg=attn_cfg, layer_idx=layer_idx,
                                  **factory_kwargs)
@@ -399,7 +388,7 @@ def _init_weights(module, n_layer, initializer_range=0.02, rescale_prenorm_resid
 class LMBackbone(nn.Module):
 
     def __init__(self, d_model: int, n_layer: int, d_inner: int, vocab_size: int,
-                 chunk_size=-1, process_group=None, layer=None,
+                 process_group=None, layer=None,
                  attn_layer_idx=None, attn_cfg=None, max_position_embeddings=0,
                  resid_dropout: float = 0.0, embed_dropout: float = 0.1,
                  layer_norm_epsilon: float = 1e-5, initializer_cfg=None,residual_in_fp32=False,
@@ -413,7 +402,7 @@ class LMBackbone(nn.Module):
 
 
         self.layers = nn.ModuleList([create_block(
-            d_model, d_inner=d_inner, chunk_size=chunk_size,
+            d_model, d_inner=d_inner,
             layer=layer, attn_layer_idx=attn_layer_idx,
             attn_cfg=attn_cfg, layer_norm_epsilon=layer_norm_epsilon,
             resid_dropout1=embed_dropout if i == 0 else resid_dropout,
@@ -444,7 +433,7 @@ class LMBackbone(nn.Module):
 class SimpleLMHeadModel(nn.Module):
 
     def __init__(self, d_model: int, n_layer: int, d_inner: int, vocab_size: int,
-                 layer=None, chunk_size=-1,
+                 layer=None,
                  attn_layer_idx=None, attn_cfg=None, max_position_embeddings=0,
                  resid_dropout: float = 0.0, embed_dropout: float = 0.1,
                  layer_norm_epsilon: float = 1e-5, initializer_cfg=None,residual_in_fp32=False,
@@ -455,8 +444,8 @@ class SimpleLMHeadModel(nn.Module):
         if vocab_size % pad_vocab_size_multiple != 0:
             vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
         self.backbone = LMBackbone(
-            d_model=d_model, n_layer=n_layer, d_inner=d_inner, vocab_size=vocab_size, 
-            chunk_size=chunk_size, layer=layer, attn_layer_idx=attn_layer_idx, attn_cfg=attn_cfg,
+            d_model=d_model, n_layer=n_layer, d_inner=d_inner, vocab_size=vocab_size,
+            layer=layer, attn_layer_idx=attn_layer_idx, attn_cfg=attn_cfg,
             max_position_embeddings=max_position_embeddings,
             resid_dropout=resid_dropout, embed_dropout=embed_dropout,
             layer_norm_epsilon=layer_norm_epsilon,
