@@ -27,6 +27,9 @@ from src.tasks import decoders, encoders, tasks
 from src.utils import registry
 from src.utils.optim_groups import add_optimizer_hooks
 
+
+from pytorch_lightning.profilers import PyTorchProfiler
+
 log = src.utils.train.get_logger(__name__)
 
 # Turn on TensorFloat32 (speeds up large model training substantially)
@@ -619,6 +622,10 @@ def create_trainer(config, **kwargs):
             gradient_as_bucket_view=True,  # https://pytorch-lightning.readthedocs.io/en/stable/advanced/advanced_gpu.html#ddp-optimizations
         )
 
+    profiler = PyTorchProfiler(
+    emit_nvtx=True,
+)
+
     # Init lightning trainer
     log.info(f"Instantiating trainer <{config.trainer._target_}>")
     # special processing for seqlen warmup scheduler (reload)
@@ -639,9 +646,9 @@ def create_trainer(config, **kwargs):
         # Set DDPStrategy to work with pl.Trainer
         config.trainer.pop('strategy')
         trainer_config_dict['strategy'] = DDPStrategy(find_unused_parameters=False, gradient_as_bucket_view=True)
-        trainer = pl.Trainer(**trainer_config_dict, callbacks=callbacks, logger=logger)
+        trainer = pl.Trainer(**trainer_config_dict, callbacks=callbacks, logger=logger, profiler=profiler)
     else:
-        trainer = hydra.utils.instantiate(config.trainer, callbacks=callbacks, logger=logger)    
+        trainer = hydra.utils.instantiate(config.trainer, callbacks=callbacks, logger=logger, profiler=profiler)    
 
     return trainer
 
