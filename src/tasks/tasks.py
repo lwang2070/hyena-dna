@@ -196,7 +196,7 @@ class LMTaskPlus(BaseTask):
         x, w = decoder(x, state=state, **z)
 
         x = x.logits
-        breakpoint()
+        # breakpoint() # Ignore breakpoint
         return x, y, w
 
 
