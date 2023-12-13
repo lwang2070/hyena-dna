@@ -253,6 +253,7 @@ class LMBackbone(nn.Module):
         n_layer: int,
         d_inner: int,
         vocab_size: int,
+        chunk_size: int = 0,
         process_group=None,
         layer=None,
         attn_layer_idx=None,
@@ -276,6 +277,7 @@ class LMBackbone(nn.Module):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        self.chunk_size = chunk_size
         self.process_group = process_group
         self.sequence_parallel = sequence_parallel
         self.residual_in_fp32 = residual_in_fp32
@@ -358,6 +360,10 @@ class LMBackbone(nn.Module):
         # If using Tensor Parallel with sequence parallel, we combine the batch and the seqlen
         # dimensions so that we can split on it easily, in case of small batch size.
         # Only the attention/SSM layers need to know the seqlen.
+        L = input_ids.size(1)
+        if self.chunk_size > 0:
+            assert L % self.chunk_size == 0, 'Sequence length must be multiples of chunk size!'
+            n = L // self.chunk_size # number of chunks in a sequence
         embedding_kwargs = (
             {"combine_batch_seqlen_dim": True}
             if self.process_group is not None and self.sequence_parallel
@@ -365,7 +371,10 @@ class LMBackbone(nn.Module):
         )
         hidden_states = self.embeddings(
             input_ids, position_ids=position_ids, **embedding_kwargs
-        )
+        )  # (B, L, D)
+        # Split sequence into chunks
+        if self.chunk_size > 0:
+            hidden_states = rearrange(hidden_states, 'b (c n) d -> (b n) c d', c=self.chunk_size)
         residual = None
         mixer_kwargs = (
             {"seqlen": input_ids.shape[1]}
@@ -394,6 +403,9 @@ class LMBackbone(nn.Module):
                 prenorm=False,
                 residual_in_fp32=self.residual_in_fp32,
             )
+        # Merge sequence
+        if self.chunk_size > 0:
+            hidden_states = rearrange(hidden_states, '(b n) c d -> b (n c) d', n=n)
         return hidden_states
 
 
@@ -404,6 +416,7 @@ class ConvLMHeadModel(nn.Module, GenerationMixin):
         n_layer: int,
         d_inner: int,
         vocab_size: int,
+        chunk_size: int = 0,
         process_group=None,
         layer=None,
         attn_layer_idx=None,
@@ -436,6 +449,7 @@ class ConvLMHeadModel(nn.Module, GenerationMixin):
             d_model=d_model,
             n_layer=n_layer,
             d_inner=d_inner,
+            chunk_size=chunk_size,
             vocab_size=vocab_size,
             process_group=process_group,
             layer=layer,
