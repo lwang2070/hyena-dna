@@ -49,11 +49,14 @@ class SelfAttention(nn.Module):
             key_padding_mask: boolean mask to apply to the attention weights. True means to keep,
                 False means to mask out. (B, S)
         """
+        torch.cuda.nvtx.range_push("Init qkv")
         batch_size, seqlen = qkv.shape[0], qkv.shape[1]
         causal = self.causal if causal is None else causal
         q, k, v = qkv.unbind(dim=2)
         softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
+        torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("unsqueeze & rearrange qkv")
         q = q.unsqueeze(1)
         k = k.unsqueeze(1)
         v = v.unsqueeze(1)
@@ -62,8 +65,13 @@ class SelfAttention(nn.Module):
             q = rearrange(q, 'b 1 (k c) h d -> b k c h d', c=self.chunk_size)
             k = rearrange(k, 'b 1 (k c) h d -> b k c h d', c=self.chunk_size)
             v = rearrange(v, 'b 1 (k c) h d -> b k c h d', c=self.chunk_size)
+        torch.cuda.nvtx.range_pop()
         
+        torch.cuda.nvtx.range_push("einsum")
         scores = torch.einsum('bkthd,bkshd->bkhts', q, k * softmax_scale)
+        torch.cuda.nvtx.range_pop()
+        
+        torch.cuda.nvtx.range_push("key_padding_mask")
         if key_padding_mask is not None:
             padding_mask = torch.full((batch_size, self.chunk_size), -10000.0, dtype=scores.dtype,
                                       device=scores.device)
@@ -76,9 +84,13 @@ class SelfAttention(nn.Module):
             causal_mask = torch.triu(torch.full((self.chunk_size, self.chunk_size), -10000.0, device=scores.device), 1)
             # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
             scores = scores + causal_mask.to(dtype=scores.dtype)
+        torch.cuda.nvtx.range_pop()
+        
+        torch.cuda.nvtx.range_push("softmax, dropout, rearrange")
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
         attention_drop = F.dropout(attention, self.dropout_p if self.training else 0.0)
         output = rearrange(torch.einsum('bkhts,bkshd->bkthd', attention_drop, v), 'b k c h d -> b (k c) h d')
+        torch.cuda.nvtx.range_pop()
         return output
 
 class MHA(nn.Module):
@@ -180,6 +192,7 @@ class GPT2Embeddings(nn.Module):
                                         **factory_kwargs)
         self.max_position_embeddings = max_position_embeddings
         if self.max_position_embeddings > 0:
+            # print("max_position_embeddings", max_position_embeddings)
             self.position_embeddings = nn.Embedding(max_position_embeddings, embed_dim,
                                                     **factory_kwargs)
 
@@ -195,6 +208,8 @@ class GPT2Embeddings(nn.Module):
         if self.max_position_embeddings > 0:
             if position_ids is None:
                 position_ids = torch.arange(seqlen, dtype=torch.long, device=input_ids.device)
+            # position_ids = position_ids % 65537 # Limit position to 65537
+            # print("position_ids", position_ids)
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = embeddings + position_embeddings
         return embeddings

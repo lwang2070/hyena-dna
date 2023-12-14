@@ -183,6 +183,7 @@ class LMTask(BaseTask):
 class LMTaskPlus(BaseTask):
     def forward(self, batch, encoder, model, decoder, _state):
         """Passes a batch through the encoder, backbone, and decoder"""
+        torch.cuda.nvtx.range_push("LMTaskPlusFw")
         # z holds arguments such as sequence length
         x, y, *z = batch # z holds extra dataloader info such as resolution
         if len(z) == 0:
@@ -196,6 +197,7 @@ class LMTaskPlus(BaseTask):
         x, w = decoder(x, state=state, **z)
 
         x = x.logits
+        torch.cuda.nvtx.range_pop()
         # breakpoint() # Ignore breakpoint
         return x, y, w
 
