@@ -132,6 +132,7 @@ class MHABase(nn.Module):
         v_dim=None,
         bias=True,
         dropout=0,
+        softmax_scale=None,
         *args,
         **kwargs,
     ):
@@ -143,6 +144,7 @@ class MHABase(nn.Module):
         self.dropout = dropout
         self.num_heads = num_heads
         self.d_model = d_model
+        self.softmax_scale = torch.sqrt(torch.tensor(d_model)) if softmax_scale is None else softmax_scale
 
         # Parameters
         self.qk_dim = d_model if qk_dim is None else qk_dim
@@ -207,6 +209,6 @@ class CMHA(MHABase):
         mask = torch.triu(torch.ones(A.size(-1), A.size(-1),
                                               dtype=torch.bool, device=A.device),
                                        diagonal=1) == 0
-        A = A * mask
+        A = A * mask / self.softmax_scale
         A = torch.nn.functional.softmax(A, dim=-1)   
         return self.o_proj(rearrange(torch.einsum('bhqv,bvhd->bhqd', A, v), 'b h q d->b q (h d)'))
