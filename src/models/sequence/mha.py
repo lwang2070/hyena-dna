@@ -120,3 +120,89 @@ class VitAttention(SequenceModule):
         x = self.proj(x)
         # x = self.proj_drop(x)
         return x, None
+
+class MHABase(nn.Module):
+    """A base class for MHA."""
+
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        qk_dim=None,
+        v_dim=None,
+        bias=True,
+        dropout=0,
+        *args,
+        **kwargs,
+    ):
+        super().__init__()
+        
+        # Attributes
+        if dropout > 0:
+            raise NotImplementedError('Dropout is not yet implemented!')
+        self.dropout = dropout
+        self.num_heads = num_heads
+        self.d_model = d_model
+
+        # Parameters
+        self.qk_dim = d_model if qk_dim is None else qk_dim
+        self.v_dim = d_model if v_dim is None else v_dim
+        assert (
+            self.qk_dim % num_heads == 0
+        ), "qk dimension must be multiples of numbers of heads!"
+        assert (
+            self.v_dim % num_heads == 0
+        ), "v dimension must be multiples of numbers of heads!"
+        self.qkv_proj = nn.Linear(d_model, self.qk_dim * 2 + self.v_dim, bias=bias)
+        self.o_proj = nn.Linear(self.v_dim, d_model, bias=bias)
+    
+    @property
+    def d_output(self):
+        return self.d_model
+
+class CMHA(MHABase):
+    
+    def __init__(self, d_model, num_heads, chunk_size, pool_method, qk_dim=None, v_dim=None, bias=True, dropout=0, *args, **kwargs):
+        # Init Base
+        super().__init__(**{k:v for k, v in locals().items() if k != 'self'})
+        
+        # Attributes
+        self.chunk_size = chunk_size
+        assert pool_method in ['max_pool', 'mean_pool'], 'Pooling method must be either max_pool or mean_pool'
+        self.pool_method = pool_method
+    
+    def forward(self, x, state=None):
+        '''
+        Input:
+            x: (B, L, D)
+        '''
+        B, L, D = x.size()
+        assert L % self.chunk_size == 0, 'Sequence length must be multiples of chunk_size.'
+        N = L // self.chunk_size  # number of chunks in a sequence
+        q, k, v = [rearrange(e, 'b l (h d) -> b l h d', h=self.num_heads) for e in torch.split(self.qkv_proj(x), [self.qk_dim, self.qk_dim, self.v_dim], dim=-1)]
+        
+        # Split into chunks (B, N, H, d) H is num_heads
+        q_chunks = rearrange(q, 'b (n c) h d -> b n c h d', c=self.chunk_size)
+        k_chunks = rearrange(k, 'b (n c) h d -> b n c h d', c=self.chunk_size)
+        
+        # Hierarchical attention        
+        if self.pool_method == 'max_pool':
+            q_pool, k_pool = q_chunks.max(dim=2)[0], k_chunks.max(dim=2)[0]  # (B, N, H, d)
+        elif self.pool_method == 'mean_pool':
+            q_pool, k_pool = q_chunks.mean(dim=2), k_chunks.mean(dim=2)
+        else:
+            raise NotImplemented(f'{self.pool_method} is not implemented!')
+        
+        #breakpoint()
+        token2chunk = torch.einsum('blhd,bnhd->bhln', q, k_pool)
+        chunk2token = torch.einsum('bnhd,bnchd->bhnc', q_pool, k_chunks)
+        A = rearrange(torch.einsum('bhln,bhnc->bhlnc', token2chunk, chunk2token), 'b h l n c -> b h l (n c)')  # (B, H, L, L)
+        
+        # Local direct attention
+        direct_attn = torch.einsum('bnqhd,bnkhd->bhnqk', q_chunks, k_chunks)
+        for i in range(N):
+            start, end = i * self.chunk_size, (i+1) * self.chunk_size
+            A[..., start:end, start:end] = direct_attn[:,:, i]
+        
+        A = torch.nn.functional.softmax(A, dim=-1)   
+        return self.o_proj(rearrange(torch.einsum('bhqv,bvhd->bhqd', A, v), 'b h q d->b q (h d)'))

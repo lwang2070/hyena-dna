@@ -15,6 +15,7 @@ from einops import rearrange
 
 from src.utils import instantiate
 import src.utils.registry as registry
+from src.models.sequence.mha import CMHA
 
 class LinearResidual(nn.Linear):
     """Wrap nn.Linear to return the residual as well. For compatibility with FusedDense.
@@ -312,8 +313,11 @@ def create_mixer_cls(layer=None,
     factory_kwargs = {'device': device, 'dtype': dtype}
     if attn_layer_idx is not None and layer_idx in attn_layer_idx:
         causal = True if attn_cfg is None else attn_cfg.pop('causal', True)
-
-        mha_cls = MHA
+        if attn_cfg.get('cmha') and attn_cfg['cmha'] == True:
+            mha_cls = CMHA
+            #attn_cfg.pop('cmha')
+        else:
+            mha_cls = MHA
 
         mixer_cls = partial(mha_cls, causal=causal, layer_idx=layer_idx,
                             **(attn_cfg if attn_cfg is not None else {}),**factory_kwargs)
