@@ -178,6 +178,7 @@ class CMHA(MHABase):
         Input:
             x: (B, L, D)
         '''
+        #breakpoint()
         B, L, D = x.size()
         assert L % self.chunk_size == 0, 'Sequence length must be multiples of chunk_size.'
         N = L // self.chunk_size  # number of chunks in a sequence
@@ -186,8 +187,9 @@ class CMHA(MHABase):
         # Split into chunks (B, N, H, d) H is num_heads
         q_chunks = rearrange(q, 'b (n c) h d -> b n c h d', c=self.chunk_size)
         k_chunks = rearrange(k, 'b (n c) h d -> b n c h d', c=self.chunk_size)
+        v_chunks = rearrange(v, 'b (n c) h d -> b n c h d', c=self.chunk_size)
         
-        # Hierarchical attention        
+        # Indirect attention        
         if self.pool_method == 'max_pool':
             q_pool, k_pool = q_chunks.max(dim=2)[0], k_chunks.max(dim=2)[0]  # (B, N, H, d)
         elif self.pool_method == 'mean_pool':
@@ -195,20 +197,33 @@ class CMHA(MHABase):
         else:
             raise NotImplemented(f'{self.pool_method} is not implemented!')
         
-        token2chunk = torch.einsum('blhd,bnhd->bhln', q, k_pool)
-        chunk2token = torch.einsum('bnhd,bnchd->bhnc', q_pool, k_chunks)
-        A = rearrange(torch.einsum('bhln,bhnc->bhlnc', token2chunk, chunk2token), 'b h l n c -> b h l (n c)')  # (B, H, L, L)
+        ## Summarise each chunk
+        chunk2token = torch.einsum('bnhd,bnchd->bhnc', q_pool, k_chunks) / self.softmax_scale
+        chunks = torch.einsum('bhnc,bnchd->bhnd', F.softmax(chunk2token, dim=-1), v_chunks)
         
-        # Local direct attention
-        direct_attn = torch.einsum('bnqhd,bnkhd->bhnqk', q_chunks, k_chunks)
-        for i in range(N):
-            start, end = i * self.chunk_size, (i+1) * self.chunk_size
-            A[..., start:end, start:end] = direct_attn[:,:, i]
+        ## Combining chunks
+        token2chunk = torch.einsum('blhd,bnhd->bhln', q, k_pool) / self.softmax_scale
+        mask = torch.arange(L).unsqueeze(-1) < (torch.arange(1, N+1) * self.chunk_size) # L1,1N->LN
+        mask = mask.to(x.device)
+        token2chunk.masked_fill_(mask, float('-inf'))
+        mixing_weight = F.softmax(token2chunk[:,:, self.chunk_size:], dim=-1)
+        mixing_weight = torch.cat([torch.zeros(B, self.num_heads, self.chunk_size, N, device=x.device), mixing_weight], dim=2)
+        indirect = torch.einsum('bhln,bhnd->bhld', mixing_weight, chunks)
         
-        # Causal mask
-        mask = torch.triu(torch.ones(A.size(-1), A.size(-1),
-                                              dtype=torch.bool, device=A.device),
-                                       diagonal=1) == 0
-        A = A * mask / self.softmax_scale
-        A = torch.nn.functional.softmax(A, dim=-1)   
-        return self.o_proj(rearrange(torch.einsum('bhqv,bvhd->bhqd', A, v), 'b h q d->b q (h d)'))
+        #TODO Note that it is possible to save exp(scores) in indirect attention to reduce recomputation of the scores
+        # Direct attention
+        direct_scores = torch.einsum('bnqhd,bnkhd->bhnqk', q_chunks, k_chunks) / self.softmax_scale
+        mask = torch.triu(torch.ones(self.chunk_size, self.chunk_size,dtype=torch.bool, device=x.device), diagonal=1)
+        direct_scores.masked_fill_(mask, float('-inf'))
+        direct_scores = torch.exp(direct_scores)
+        
+        ## Normalisation constant
+        Z = torch.einsum('bhnqk->bhnq', direct_scores) +\
+                rearrange(torch.einsum('bhln->bhl', torch.exp(token2chunk)), 'b h (n c) -> b h n c', c=self.chunk_size)
+        
+        ## Mixing direct attention
+        direct = rearrange(torch.einsum('bhnqk,bnkhd->bhnqd', direct_scores / Z[..., None], v_chunks), 'b h n c d -> b h (n c) d')
+        
+        total = rearrange(indirect + direct, 'b h l d -> b l (h d)')
+
+        return self.o_proj(total)

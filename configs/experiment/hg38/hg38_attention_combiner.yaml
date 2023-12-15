@@ -46,8 +46,8 @@ trainer:
 
 dataset:
   # batch_size: 32  # Per GPU
-  batch_size: 16
-  max_length: 2049 # 262144, 524288
+  batch_size: 1
+  max_length: 65537 # 262144, 524288
   # optional, default is max_length
   max_length_val: ${dataset.max_length}
   max_length_test: ${dataset.max_length}
