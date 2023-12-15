@@ -193,7 +193,6 @@ class CMHA(MHABase):
         else:
             raise NotImplemented(f'{self.pool_method} is not implemented!')
         
-        #breakpoint()
         token2chunk = torch.einsum('blhd,bnhd->bhln', q, k_pool)
         chunk2token = torch.einsum('bnhd,bnchd->bhnc', q_pool, k_chunks)
         A = rearrange(torch.einsum('bhln,bhnc->bhlnc', token2chunk, chunk2token), 'b h l n c -> b h l (n c)')  # (B, H, L, L)
@@ -204,5 +203,10 @@ class CMHA(MHABase):
             start, end = i * self.chunk_size, (i+1) * self.chunk_size
             A[..., start:end, start:end] = direct_attn[:,:, i]
         
+        # Causal mask
+        mask = torch.triu(torch.ones(A.size(-1), A.size(-1),
+                                              dtype=torch.bool, device=A.device),
+                                       diagonal=1) == 0
+        A = A * mask
         A = torch.nn.functional.softmax(A, dim=-1)   
         return self.o_proj(rearrange(torch.einsum('bhqv,bvhd->bhqd', A, v), 'b h q d->b q (h d)'))
