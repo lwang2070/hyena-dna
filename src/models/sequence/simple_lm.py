@@ -189,6 +189,58 @@ class GPT2Embeddings(nn.Module):
             embeddings = embeddings + position_embeddings
         return embeddings
 
+class SinEmbeddings(nn.Module):
+    
+    def __init__(self, d_model, vocab_size, max_length, base=10000, padding_idx=None, device=None, dtype=None):
+        super().__init__()
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        
+        # Attributes
+        assert d_model % 2 == 0, 'd_model must be even!'
+        self.d_model = d_model
+        self.base = base
+        
+        # Params
+        self.word_embeddings = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx, **factory_kwargs)
+        pe_cache = self._init_pe(d_model, max_length, base).to(**factory_kwargs)
+        self.register_buffer("pe", pe_cache, persistent=False)
+    
+    @staticmethod
+    def _init_pe(d_model, length, base, start=0):
+        '''
+        Input:
+            start: Inclusive
+        
+        Output:
+            pe: (L, D)
+        '''
+        half_dim = d_model // 2
+        pos = torch.arange(start=start, end=start+length).unsqueeze(-1)  # (L, 1)
+        dim = torch.arange(half_dim)  # (D/2, )
+        
+        freqs = torch.exp(- torch.log(torch.tensor(base)) / (half_dim - 1) * dim)  # Compute frequencies in the log domain
+        sin = torch.sin(pos * freqs)
+        cos = torch.cos(pos * freqs)
+        
+        output = torch.empty(length, d_model)
+        output[:, 0::2] = sin
+        output[:, 1::2] = cos
+        output.requires_grad = False
+        return output
+    
+    def forward(self, input_ids, position_ids=None):
+        """
+            input_ids: (batch, seqlen)
+            position_ids: (batch, seqlen)
+        """
+        seqlen = input_ids.size(1)
+        embeddings = self.word_embeddings(input_ids)
+        if position_ids is None:
+            position_ids = torch.arange(seqlen, dtype=torch.long, device=input_ids.device)
+        position_embeddings = self.pe[position_ids]
+        embeddings = embeddings + position_embeddings
+        return embeddings
+
 class Mlp(nn.Module):
 
     def __init__(self, in_features, hidden_features=None, out_features=None, activation=F.gelu,
@@ -393,6 +445,7 @@ class LMBackbone(nn.Module):
 
     def __init__(self, d_model: int, n_layer: int, d_inner: int, vocab_size: int,
                  process_group=None, layer=None,
+                 positional_embedding='gpt2',
                  attn_layer_idx=None, attn_cfg=None, max_position_embeddings=0,
                  resid_dropout: float = 0.0, embed_dropout: float = 0.1,
                  layer_norm_epsilon: float = 1e-5, initializer_cfg=None,residual_in_fp32=False,
@@ -401,9 +454,13 @@ class LMBackbone(nn.Module):
         super().__init__()
         self.process_group = process_group
         self.residual_in_fp32 = residual_in_fp32
-        self.embeddings = GPT2Embeddings(d_model, vocab_size, max_position_embeddings,
+        if positional_embedding == 'gpt2':
+            self.embeddings = GPT2Embeddings(d_model, vocab_size, max_position_embeddings,
                                              **factory_kwargs)
-
+        elif positional_embedding == 'sinusoidal':
+            self.embeddings = SinEmbeddings(d_model, vocab_size, max_position_embeddings, **factory_kwargs)
+        else:
+            raise NotImplementedError(f'{positional_embedding} is not implemented!')
 
         self.layers = nn.ModuleList([create_block(
             d_model, d_inner=d_inner,
@@ -438,6 +495,7 @@ class SimpleLMHeadModel(nn.Module):
 
     def __init__(self, d_model: int, n_layer: int, d_inner: int, vocab_size: int,
                  layer=None,
+                 positional_embedding='gpt2',
                  attn_layer_idx=None, attn_cfg=None, max_position_embeddings=0,
                  resid_dropout: float = 0.0, embed_dropout: float = 0.1,
                  layer_norm_epsilon: float = 1e-5, initializer_cfg=None,residual_in_fp32=False,
@@ -449,7 +507,9 @@ class SimpleLMHeadModel(nn.Module):
             vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
         self.backbone = LMBackbone(
             d_model=d_model, n_layer=n_layer, d_inner=d_inner, vocab_size=vocab_size,
-            layer=layer, attn_layer_idx=attn_layer_idx, attn_cfg=attn_cfg,
+            layer=layer,
+            positional_embedding=positional_embedding,
+            attn_layer_idx=attn_layer_idx, attn_cfg=attn_cfg,
             max_position_embeddings=max_position_embeddings,
             resid_dropout=resid_dropout, embed_dropout=embed_dropout,
             layer_norm_epsilon=layer_norm_epsilon,
