@@ -139,8 +139,6 @@ class MHABase(nn.Module):
         super().__init__()
         
         # Attributes
-        if dropout > 0:
-            raise NotImplementedError('Dropout is not yet implemented!')
         self.dropout = dropout
         self.num_heads = num_heads
         self.d_model = d_model
@@ -172,6 +170,9 @@ class CMHA(MHABase):
         self.chunk_size = chunk_size
         assert pool_method in ['max_pool', 'mean_pool'], 'Pooling method must be either max_pool or mean_pool'
         self.pool_method = pool_method
+        
+        # Modules
+        self.attn_drop = nn.Dropout(dropout)
     
     def forward(self, x, state=None):
         '''
@@ -199,6 +200,7 @@ class CMHA(MHABase):
         
         ## Summarise each chunk
         chunk2token = torch.einsum('bnhd,bnchd->bhnc', q_pool, k_chunks) / self.softmax_scale
+        chunk2token = self.attn_drop(chunk2token)
         chunks = torch.einsum('bhnc,bnchd->bhnd', F.softmax(chunk2token, dim=-1), v_chunks)
         
         ## Combining chunks
@@ -213,6 +215,7 @@ class CMHA(MHABase):
         #TODO Note that it is possible to save exp(scores) in indirect attention to reduce recomputation of the scores
         # Direct attention
         direct_scores = torch.einsum('bnqhd,bnkhd->bhnqk', q_chunks, k_chunks) / self.softmax_scale
+        direct_scores = self.attn_drop(direct_scores)
         mask = torch.triu(torch.ones(self.chunk_size, self.chunk_size,dtype=torch.bool, device=x.device), diagonal=1)
         direct_scores.masked_fill_(mask, float('-inf'))
         direct_scores = torch.exp(direct_scores)
